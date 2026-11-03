@@ -29,6 +29,6 @@
 
 ## 部署
 
-Cloud Run → `tpl-rules-agent-gemini`（asia-southeast1）→「設定持續部署」→ 連結這個 repo、
-分支 `main`、建構類型選 Dockerfile。之後 push 到 `main` 就會自動部署，服務原有的環境變數、
-Secret、服務帳號、CPU／記憶體設定都會保留。
+push 到 `main` → Cloud Build 觸發器（asia-southeast1）依 `cloudbuild.yaml` 建映像、推到
+`tpl-rules/api:<commit SHA>`、`gcloud run deploy` 更新 `tpl-rules-agent-gemini`。只換映像，
+服務原有的環境變數、Secret、服務帳號、CPU／記憶體設定都保留。

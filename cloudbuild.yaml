@@ -1,0 +1,17 @@
+# push 到 main → Cloud Build 觸發器 → 建映像 → 推到 Artifact Registry → 更新 Cloud Run 服務
+# 映像標籤用 commit 短 SHA，不會覆蓋 Dockerfile 底層用的 gemini-v5 標籤。
+# gcloud run deploy 只換映像，服務原有的 Secret、服務帳號、CPU／記憶體、公開存取設定都保留。
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-t", "asia-southeast1-docker.pkg.dev/$PROJECT_ID/tpl-rules/api:$SHORT_SHA", "."]
+  - name: gcr.io/cloud-builders/docker
+    args: ["push", "asia-southeast1-docker.pkg.dev/$PROJECT_ID/tpl-rules/api:$SHORT_SHA"]
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args: ["run", "deploy", "tpl-rules-agent-gemini",
+           "--image=asia-southeast1-docker.pkg.dev/$PROJECT_ID/tpl-rules/api:$SHORT_SHA",
+           "--region=asia-southeast1", "--quiet"]
+images: ["asia-southeast1-docker.pkg.dev/$PROJECT_ID/tpl-rules/api:$SHORT_SHA"]
+options:
+  logging: CLOUD_LOGGING_ONLY
+timeout: 1800s
