@@ -10,6 +10,10 @@ GET  /health        模型與檢索資源是否載入完成（可用來預熱；
 2026-11-03：選填 judge_feedback／recalc_round——法官代理人不同意時，claim-intake-v2 帶著退回理由重打本端點
 （最多退回 3 次）。檢索仍只用原本的 case_description（證據不因退回意見而改變），退回意見附在 prompt 的
 案件描述之後，請模型依同樣證據重新檢查；沒帶 judge_feedback 時行為與先前完全相同。
+2026-11-25（v8）：選填 record_counts——{"episode_count","seq_count","visit_count","injury_insured"}
+（claim_episodes／coverages／medical_visits 筆數、31／33 險種保額合計），API 依 01 v8 規則 A／B 算出
+[詐欺偵測規則] 區塊附在案件描述最後（只給 Gemini、不進檢索）。呼叫端也可以自己把區塊附在 case_description
+最後，API 會在檢索前把它拆掉。檢索到 train 的 Isolation Forest 離群案例時，內文前面加 [異常偵測標記：疑似詐欺]。
 回應比舊版多：is_system_error / _error_reason（前端必須顯示為「系統錯誤，需人工複核」）、
 evidence（本次 prompt 裡每個證據編號對應的內容，讓前端能顯示 [clause-1] 是什麼）、elapsed。
 """
@@ -18,6 +22,9 @@ from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
+
+from .fraud import (build_fraud_rule_lines, fraud_rule_check, split_rule_block, annotate_fraud_flags,
+                    FRAUD_FLAG_ENABLED, FRAUD_RULE_ENABLED, TRAIN_FRAUD_CASE_NOS)
 
 API_KEY = os.environ.get("API_KEY", "").strip()
 app = FastAPI(title="TPL 規則代理人 v2（Gemma 4 12B adapter）")
@@ -30,6 +37,7 @@ class RulesRequest(BaseModel):
     seed_case_no: Optional[str] = None   # 已知的歷史案號（驗證用）；新案件留空
     judge_feedback: Optional[str] = None # 法官代理人的退回理由（退回重算時才帶）
     recalc_round: Optional[int] = None   # 第幾次退回（1–3）
+    record_counts: Optional[dict] = None # v8：詐欺偵測規則用的 4 個紀錄筆數欄位（見檔頭說明）
 
 
 def _with_judge_feedback(case_description: str, feedback: Optional[str], rnd: Optional[int]) -> str:
@@ -50,7 +58,9 @@ def _load():
         from . import retrieval
         _state["info"]["retrieval"] = retrieval.init(device="cpu")
         from . import gemini_agent
-        _state["info"]["model"] = {"llm": gemini_agent.LLM_MODEL_NAME, "prompt": "v5"}
+        _state["info"]["model"] = {"llm": gemini_agent.LLM_MODEL_NAME, "prompt": gemini_agent.PROMPT_VERSION}
+        _state["info"]["fraud"] = {"flag_enabled": FRAUD_FLAG_ENABLED, "rule_enabled": FRAUD_RULE_ENABLED,
+                                   "train_outlier_case_nos": len(TRAIN_FRAUD_CASE_NOS)}
         _state["info"]["load_sec"] = round(time.time() - t0)
         _state["ready"] = True
         print(f"[啟動] 完成 {_state['info']}", flush=True)
@@ -93,17 +103,28 @@ def rules(req: RulesRequest, x_api_key: Optional[str] = Header(None)):
     from .retrieval import fusion_retrieve
     from .gemini_agent import call_rules_agent
     t0 = time.time()
+    # v8：檢索用不含 [詐欺偵測規則] 的描述；規則區塊只附在給 Gemini 的案件描述最後
+    retrieval_query, rule_block = split_rule_block(req.case_description)
+    fraud_rule = None
+    if rule_block is None and req.record_counts is not None and FRAUD_RULE_ENABLED:
+        fraud_rule = fraud_rule_check(req.record_counts)
+        rule_block = "\n".join(build_fraud_rule_lines(req.record_counts)).strip()
+    llm_query = f"{retrieval_query}\n\n{rule_block}" if rule_block else retrieval_query
     if True:  # Gemini 版不佔 GPU，可並行
-        evidence = fusion_retrieve(req.case_description, seed_case_no=req.seed_case_no, verbose=False)
+        evidence = fusion_retrieve(retrieval_query, seed_case_no=req.seed_case_no, verbose=False)
+        annotate_fraud_flags(evidence)
         t1 = time.time()
-        result = call_rules_agent(_with_judge_feedback(req.case_description, req.judge_feedback, req.recalc_round), evidence)
+        result = call_rules_agent(_with_judge_feedback(llm_query, req.judge_feedback, req.recalc_round), evidence)
         result.pop("_meta", None)
     result["evidence"] = _evidence_summary(evidence)
     result["graph_seed_case_no"] = evidence.get("graph_seed_case_no")
+    result["fraud_rule"] = fraud_rule if fraud_rule is not None else ({"provided_in_description": True} if rule_block else None)
+    result["n_fraud_flagged_claims"] = evidence.get("n_fraud_flagged_claims", 0)
     result["needs_manual_review"] = bool(result.get("is_system_error")) or result.get("decision") in ("拒賠", "疑似詐欺")
     result["elapsed"] = {"retrieval_sec": round(t1 - t0, 1), "total_sec": round(time.time() - t0, 1)}
     result["recalc_round"] = req.recalc_round if (req.judge_feedback or "").strip() else None
-    result["version"] = "tpl-rules-agent-gemini（01 v6 融合檢索 + Gemini，prompt v5；支援法官退回意見）"
+    from .gemini_agent import PROMPT_VERSION
+    result["version"] = f"tpl-rules-agent-gemini（01 v8 融合檢索 + IF 離群標記 + 詐欺偵測規則 + Gemini，prompt {PROMPT_VERSION}；支援法官退回意見）"
     print(f"[案件] round={result['recalc_round']} decision={result.get('decision')} system_error={result.get('is_system_error')} "
           f"reason={result.get('_error_reason')} {result['elapsed']}", flush=True)
     return result
